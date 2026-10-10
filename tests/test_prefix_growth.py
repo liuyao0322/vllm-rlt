@@ -273,7 +273,8 @@ def test_async_pressure_preemption_with_resident_state():
 
 
 @pytest.mark.gpu
-def test_async_preemption_restores_prelude_token_in_a_new_slot():
+@pytest.mark.parametrize("use_uva", [False, True])
+def test_async_preemption_restores_prelude_token_in_a_new_slot(use_uva):
     # A preempted request releases its async slot. A later arrival takes it
     # (LIFO), so the victim resumes in another slot whose device token belongs
     # to a different request. Distinct prompts make a stale token visible.
@@ -282,7 +283,7 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
 
     torch.manual_seed(72)
     m = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device="cuda", dtype=torch.bfloat16)
-    results, victim_stages = [], []
+    results, victim_stages, slot_changes = [], [], []
     for blocks in [128, 24]:
         e = LLMEngine(
             m,
@@ -297,6 +298,20 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
             exit_config=ExitConfig("trace", depths_by_request={"t": [4, 1, 2, 3, 4, 1, 2, 3]}),
             execution_config=ExecutionConfig(async_scheduling=True),
         )
+        resident = e.model_runner.async_state
+        resident.use_uva = use_uva
+        previous_slots = {}
+        ensure_slot = resident.ensure_slot
+
+        def record_slot(request, bank):
+            slot = ensure_slot(request, bank)
+            previous = previous_slots.get(request.request_id)
+            if previous is not None and previous != slot:
+                slot_changes.append((request.request_id, request.stage, previous, slot))
+            previous_slots[request.request_id] = slot
+            return slot
+
+        resident.ensure_slot = record_slot
         select = e.preemption._select_preemption_victim
 
         def record_victim(*args, **kwargs):
@@ -315,5 +330,7 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
             )
         results.append({rid: out.token_ids for rid, out in finish(e).items()})
         assert not e.preemption.snapshots and e.cache_manager.num_used_blocks == 0
+        assert not resident.slots and not resident.owners
     assert Stage.PRELUDE in victim_stages
+    assert any(stage == Stage.PRELUDE for _, stage, _, _ in slot_changes)
     assert results[0] == results[1]
