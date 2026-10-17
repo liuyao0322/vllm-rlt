@@ -5,7 +5,13 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
-from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.config import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SchedulerConfig,
+    resolve_cuda_graph_rows,
+)
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
@@ -58,6 +64,10 @@ class LLMEngine:
                 raise ValueError("Huginn speculative decoding is not yet supported")
         self.speculative_config = speculative_config
         self.async_speculative = bool(speculative_config and self.execution_config.async_scheduling)
+        # Graphs and memory planning must read the same resolved row limit.
+        self.execution_config = resolve_cuda_graph_rows(
+            self.execution_config, scheduler_config, speculative_config
+        )
         if speculative_config is not None:
             if cache_config.layout != "last_exited":
                 raise ValueError("speculative decoding requires last_exited KV")
@@ -93,12 +103,15 @@ class LLMEngine:
         if self.execution_config.cuda_graphs and parameter.device.type != "cuda":
             raise ValueError("CUDA graphs require CUDA with Triton or FlashAttention")
         if self.execution_config.cuda_graphs and speculative_config is not None:
-            rows = scheduler_config.max_num_seqs * (speculative_config.num_speculative_tokens + 1)
+            rows = min(
+                scheduler_config.max_num_seqs * (speculative_config.num_speculative_tokens + 1),
+                scheduler_config.max_num_batched_tokens,
+            )
             if rows > self.execution_config.cuda_graph_max_batch_size:
                 logger.warning(
                     "CUDA Graph row limit %d cannot cover %d verification rows "
                     "(max_num_seqs=%d, K=%d); larger batches run eager. "
-                    "Raise cuda_graph_max_batch_size explicitly to expand coverage "
+                    "Raise cuda_graph_max_batch_size, or leave it unset to cover them, "
                     "and budget additional graph memory.",
                     self.execution_config.cuda_graph_max_batch_size,
                     rows,
@@ -193,6 +206,13 @@ class LLMEngine:
                 multi_stream=self.execution_config.multi_stream,
                 rng=self.rng,
             )
+        self.draft_policy = None
+        if self.async_speculative and speculative_config.draft_tokens_override is not None:
+            forced = speculative_config.draft_tokens_override
+            self.scheduler.draft_tokens = lambda starts: forced
+        elif self.async_speculative and speculative_config.draft_policy == "adaptive":
+            self.draft_policy = self._make_draft_policy(scheduler_config)
+            self.scheduler.draft_tokens = self.draft_policy.choose
         self._pending_speculative = []
         self._retiring_speculative = {}
         self._exit_traces = {
@@ -209,6 +229,50 @@ class LLMEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.preempt_callback = self.preemption.preempt
             self.scheduler.resume_callback = self.preemption.resume
+
+    def _make_draft_policy(self, scheduler_config):
+        from vllm_rlt.worker.cuda_graph import _bucket_size
+        from vllm_rlt.worker.draft_policy import (
+            AdaptiveDraftPolicy,
+            calibrated_prior,
+            round_features,
+            time_replays,
+        )
+
+        runner = cast("AsyncSpeculativeRunner", self.speculative_runner)
+        spec = self.speculative_config
+        bucket, prior = None, None
+        if runner.graphs is not None:
+            sizes = runner.graphs.capture_sizes
+            limit = sizes[-1]
+
+            # Rows above the largest bucket run eager: approximately linear.
+            def bucket(rows):
+                return _bucket_size(sizes, rows) if rows <= limit else rows
+
+            with torch.cuda.device(runner.device):
+                prior = calibrated_prior(
+                    time_replays(runner.graphs),
+                    time_replays(runner.coda_graphs),
+                    spec.draft_loops,
+                    spec.target_loops,
+                )
+        policy = AdaptiveDraftPolicy(
+            spec.num_speculative_tokens,
+            spec.draft_loops,
+            spec.target_loops,
+            token_budget=scheduler_config.max_num_batched_tokens,
+            bucket=bucket,
+            prior=prior,
+        )
+        runner.round_features = lambda items: round_features(
+            [item.token_start for item in items],
+            [item.token_count for item in items],
+            spec.draft_loops,
+            spec.target_loops,
+            bucket,
+        )
+        return policy
 
     def add_request(
         self,
@@ -510,6 +574,9 @@ class LLMEngine:
         if not ticket.ready():
             runner.readback_waits += 1
         results, frontiers = ticket.collect()
+        if self.draft_policy is not None and ticket.timing is not None:
+            start, end, features = ticket.timing
+            self.draft_policy.observe_time(features, start.elapsed_time(end))
         outputs = []
         for item, state, round_id, result, frontier in zip(
             ticket.batch.items,
@@ -551,6 +618,8 @@ class LLMEngine:
                     break
             runner.stats.committed_tokens += emitted
             runner.stats.accepted_tokens += min(result.accepted_count, emitted)
+            if self.draft_policy is not None:
+                self.draft_policy.observe_acceptance(result.draft_count, result.accepted_count)
             # In particular, do NOT truncate KV here: the GPU may already be
             # writing the following round at a later actual position.
             if request.stage != Stage.FINISHED:
