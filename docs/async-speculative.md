@@ -163,22 +163,54 @@ The model runner shares its compute and result-copy streams with speculation. Se
 `multi_stream=False` orders the copy on the compute stream as well; cross-round
 CPU/GPU submission remains asynchronous, but D2H no longer overlaps computation.
 
-## Fixed draft length
+## Adaptive K follow-up status
 
-Both async and synchronous speculation use `SpeculativeConfig(num_speculative_tokens=K)`
-or `--speculative-tokens K`. The configured draft count stays fixed, subject to
-output, context and scheduler token-budget limits that can shorten a round,
-including effective K=0. Draft and target model depths also stay fixed.
+This branch restores adaptive K separately on top of the fixed-K Graph/routing
+change. It retains the stabilized information-matrix cost fit and regression
+coverage from `05891dd`. It is work in progress: calibration, acceptance history,
+default policy and comparison against the best fixed K still need review and
+validation. Historical adaptive measurements do not qualify this branch.
 
-Adaptive K, its timing/calibration hooks and policy configuration are split out
-of this PR. There is no `--draft-policy` option in this implementation. Historical
-adaptive measurements below are retained for attribution, not as evidence for
-the current default or an isolated adaptive-over-best-fixed-K improvement.
+## Draft policy
 
-The async runner gathers and scatters its two-column `(token, position)` slot
-state with the existing Triton routing kernels (`H=2`). Acceptance still computes
-each request's prefix match and correction independently. Slot allocation,
-round completion events and deferred retirement retain their existing owners.
+`SpeculativeConfig.draft_policy` / `--draft-policy` accepts `adaptive` (default)
+or `fixed`. **The adaptive default applies to all async speculation, with or
+without CUDA Graphs.** It does not enable async scheduling, speculation or
+Graphs by itself: those remain opt-in. Draft/target model depths stay fixed;
+adaptive draft counts do not enable adaptive model exit.
+
+With `adaptive`, `num_speculative_tokens=K` is the per-round maximum. Each round
+chooses K' in `[0, K]` using observed compute-stream round times and per-position
+acceptance estimates; K'=0 is a full-depth single-token round. The policy fits
+round cost online with regularized exponentially weighted least squares, uses a Beta prior for
+acceptance, and periodically explores other lengths. When Graphs are enabled,
+startup bucket replay timings initialize the cost prior. No new CPU token read
+is required to select the next round's length.
+
+The acceptance estimate is a population statistic conditional on the preceding
+candidates being accepted, indexed by offset within a draft. It estimates the
+expected committed-token count for the cost model; it does not predict whether
+the current request's next candidate will be accepted from its model state.
+The combined Graph/vectorization performance tables below do not isolate the
+benefit of adaptive K over the best fixed K.
+
+The cost fit uses scaled features and a persistent ridge of `1e-4` in normalized
+coordinates. Its information matrix is updated as
+`A = forgetting * A + x x^T + (1 - forgetting) * ridge * I` and solved by
+Cholesky, without recursively inflating an inverse covariance. The ridge bounds
+uncertainty in unobserved directions even for repeated collinear full batches.
+Non-finite observations are ignored; invalid fits recover to the calibrated
+prior and increment `fit_resets` in the policy summary. Negative extrapolated
+costs use the prior rather than becoming an artificially cheap candidate.
+A CPU regression exercises 80,000 rejected-draft rounds and a late timing change;
+additional cases check recovery from invalid coefficients or information state.
+
+For fixed K, use `SpeculativeConfig(num_speculative_tokens=2, draft_policy="fixed")`
+or append `--draft-policy fixed` to the CLI. This retains the configured proposal
+count, subject to ordinary output/context/token-budget limits that can shorten
+a round. Synchronous speculation continues to use fixed K regardless of this
+async policy setting. The diagnostic `draft_tokens_override`, when supplied,
+takes precedence over policy selection.
 
 ## CUDA Graph execution
 
